@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>清单 #{{ view.checklist.id }} · 齐套核对</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>清单 #{{ view.checklist.id }} · 批号 <code>{{ view.checklist.batch_no }}</code></h1>
+  <p class="nav"><a href="/checklists">← 全部清单</a></p>
+</header>
+<main>
+{% if flash %}<div class="flash ok">{{ flash }}</div>{% endif %}
+
+<section class="cards">
+  <div class="card"><span>清单对数</span><strong>{{ view.summary.pairs }}</strong></div>
+  <div class="card"><span>齐套</span><strong>{{ view.summary.ok }}</strong></div>
+  <div class="card warn"><span>缺失</span><strong>{{ view.summary.missing }}</strong></div>
+  <div class="card warn"><span>冲突</span><strong>{{ view.summary.conflict }}</strong></div>
+</section>
+
+{% if view.preparing %}
+<section class="panel">
+  <div class="flash warn">
+    <strong>准备中</strong>：既有报告仍在补建（{{ view.backfill.reports_projected }} / {{ view.backfill.report_total }}）。
+    补建完成前不发布缺项或冲突结论，此清单也不会显示为可交分析。
+  </div>
+</section>
+{% else %}
+<section class="panel">
+  {% if view.ready %}
+    <div class="flash ok">齐套：清单内全部（样本号,项目）均已核对，且各对只有一个测值，无缺项、无冲突。可交分析。</div>
+  {% else %}
+    <div class="flash bad">不齐套：存在缺项或冲突，不可交分析（见下表）。</div>
+  {% endif %}
+</section>
+{% endif %}
+
+<section class="panel">
+  <h2>逐对核对</h2>
+  <table>
+    <thead><tr><th>行</th><th>样本号</th><th>项目</th><th>结果</th><th>测值 / 来源报告</th></tr></thead>
+    <tbody>
+    {% for p in view.pairs %}
+      <tr class="{{ 'row-bad' if p.status == 'conflict' else '' }}">
+        <td>{{ p.line_no }}</td>
+        <td>{{ p.sample_no }}</td>
+        <td>{{ p.item }}</td>
+        <td>
+          {% if view.preparing %}
+            <span class="badge warn">准备中</span>
+          {% elif p.status == "ok" %}
+            <span class="badge ok">齐套</span>
+          {% elif p.status == "missing" %}
+            <span class="badge bad">缺项</span>
+          {% elif p.status == "conflict" %}
+            <span class="badge bad">冲突</span>
+          {% else %}
+            <span class="badge warn">待核对</span>
+          {% endif %}
+        </td>
+        <td>
+          {% if view.preparing %}
+            <span class="muted">补建完成后显示</span>
+          {% elif not p.value_groups %}
+            <span class="muted">无相关报告数据行</span>
+          {% else %}
+            <ul class="values">
+              {% for g in p.value_groups %}
+              <li>
+                <code>{{ g.value }}</code>
+                {% for s in g.sources %}
+                  <span class="src">{{ "采集" if s.source == "live" else "补建" }}</span>
+                  <a href="/api/messages/{{ s.source_message_id }}">{{ s.report_no }}</a>
+                  {% if s.attachment_path %}
+                    <a href="/api/reports/{{ s.report_id }}/attachment">原件</a>
+                  {% endif %}
+                  {% if not loop.last %}、{% endif %}
+                {% endfor %}
+              </li>
+              {% endfor %}
+            </ul>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+{% if not view.preparing and (view.missing or view.conflicts) %}
+<section class="panel">
+  <h2>问题汇总</h2>
+  {% if view.missing %}
+  <h3>缺项（{{ view.missing|length }}）</h3>
+  <ul>{% for p in view.missing %}<li>{{ p.sample_no }} / {{ p.item }}（第 {{ p.line_no }} 行）</li>{% endfor %}</ul>
+  {% endif %}
+  {% if view.conflicts %}
+  <h3>冲突（{{ view.conflicts|length }}）</h3>
+  <ul>
+    {% for p in view.conflicts %}
+      <li>{{ p.sample_no }} / {{ p.item }}：
+        {% for g in p.value_groups %}<code>{{ g.value }}</code>（{{ g.report_nos|join("、") }}）{% if not loop.last %} vs {% endif %}{% endfor %}
+      </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</section>
+{% endif %}
+
+<section class="panel">
+  <h2>清单内容（受理后不可改）</h2>
+  <dl class="kv">
+    <dt>批号</dt><dd><code>{{ view.checklist.batch_no }}</code></dd>
+    <dt>受理时间</dt><dd>{{ view.checklist.created_at }}</dd>
+    <dt>对数</dt><dd>{{ view.checklist.pair_count }}</dd>
+  </dl>
+</section>
+</main>
+</body>
+</html>

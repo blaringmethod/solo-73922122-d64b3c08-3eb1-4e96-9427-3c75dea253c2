@@ -137,5 +137,73 @@ rows=json.load(sys.stdin)
 for r in sorted(rows, key=lambda x: (x["uidvalidity"], x["uid"]))[-10:]:
     print(r["uidvalidity"], r["uid"], r["decision"], r["mark_state"], r["report_nos"], r["reason"] or "")'
 
+# ---------------------------------------------------------------------------
+# 9. 齐套核对：上传清单 → 核对 → 缺项 → 齐套后异值到达
+# ---------------------------------------------------------------------------
+step "9. 齐套核对（清单上传 → 核对 → 结论）"
+# 批号与样本号带时间戳，脚本可重复运行；已受理清单永远不可改。
+STAMP=$(date +%s)
+BATCH_OK="DEMO-OK-$STAMP"
+BATCH_MISS="DEMO-MISS-$STAMP"
+SAMPLE_A="Q$STAMP-A"
+SAMPLE_B="Q$STAMP-B"
+# 先入仓两对“历史”数据，再由清单核对它们。
+deliver "{\"subject\":\"演示-齐套历史\",\"attachments\":[
+  {\"filename\":\"DEMO-Q1.csv\",\"report_no\":\"DEMO-Q$STAMP-1\",\"sample_no\":\"$SAMPLE_A\",\"item\":\"ALT\",\"value\":\"21\"},
+  {\"filename\":\"DEMO-Q2.csv\",\"report_no\":\"DEMO-Q$STAMP-2\",\"sample_no\":\"$SAMPLE_B\",\"item\":\"GLU\",\"value\":\"5.4\"}]}" >/dev/null
+curl -fsS -X POST "$APP_A/api/scan" >/dev/null
+printf '样本号,项目\n%s,ALT\n%s,GLU\n' "$SAMPLE_A" "$SAMPLE_B" > /tmp/checklist-demo.csv
+CREATED=$(curl -fsS -X POST "$APP_A/api/checklists" -F batch_no="$BATCH_OK" \
+  -F file=@/tmp/checklist-demo.csv)
+echo "$CREATED" | python3 -m json.tool
+OK_ID=$(echo "$CREATED" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+curl -fsS -X POST "$APP_A/api/checklists/backfill" | python3 -c 'import json,sys
+d=json.load(sys.stdin); print("补建:", d["backfill"]["status"], d["backfill"]["reports_projected"], "/", d["backfill"]["report_total"])'
+curl -fsS "$APP_B/api/checklists/$OK_ID" | python3 -c 'import json,sys
+d=json.load(sys.stdin); print("清单:", d["batch_no"], d["state"], "ready=", d["ready"], d["summary"])
+assert d["state"] == "ready" and d["ready"], d'
+
+step "9b. 缺项可见（清单含不存在的样本）"
+printf '样本号,项目\nMISSING-%s,XXX\n' "$STAMP" > /tmp/checklist-missing.csv
+MISS_ID=$(curl -fsS -X POST "$APP_A/api/checklists" -F batch_no="$BATCH_MISS" \
+  -F file=@/tmp/checklist-missing.csv | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+curl -fsS "$APP_A/api/checklists/$MISS_ID" | python3 -c 'import json,sys
+d=json.load(sys.stdin); print("清单:", d["batch_no"], d["state"], d["summary"])
+assert d["pairs"][0]["status"] == "missing" and not d["ready"]'
+
+step "9c. 齐套后收到相关异值 → 立即转为冲突，不再显示可交分析"
+curl -fsS -X POST "$DEMO/ctl/deliver" -H 'Content-Type: application/json' \
+  -d "{\"subject\":\"演示-齐套后异值\",\"attachments\":[
+       {\"filename\":\"DEMO-Q1-alt.csv\",\"report_no\":\"DEMO-Q$STAMP-1B\",
+        \"sample_no\":\"$SAMPLE_A\",\"item\":\"ALT\",\"value\":\"99\"}]}" >/dev/null
+curl -fsS -X POST "$APP_B/api/scan" | json
+curl -fsS "$APP_A/api/checklists/$OK_ID" | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+print("清单:", d["batch_no"], d["state"], "ready=", d["ready"], d["summary"])
+assert d["ready"] is False and any(p["status"]=="conflict" for p in d["pairs"])
+print("冲突项:", [(p["sample_no"], [(g["value"], g["report_nos"]) for g in p["values"]])
+                  for p in d["pairs"] if p["status"]=="conflict"])'
+curl -fsS "$APP_A/checklists/$OK_ID" | grep -q "不可交分析" && echo "页面：不可交分析"
+if curl -fsS "$APP_A/checklists/$OK_ID" | grep -q "可交分析" \
+   && ! curl -fsS "$APP_A/checklists/$OK_ID" | grep -q "不可交分析"; then
+  echo "错误：冲突清单仍显示可交分析" >&2; exit 1
+fi
+
+step "9d. 拒收邮件不参与核对"
+curl -fsS -X POST "$DEMO/ctl/deliver" -H 'Content-Type: application/json' \
+  -d '{"subject":"演示-拒收不参与","attachments":[
+       {"filename":"bad.csv","content":"bad,header\n1,2\n"}]}' >/dev/null
+curl -fsS -X POST "$APP_A/api/scan" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("拒收:", d["rejected"])'
+
+step "9e. 双实例不再重复累计"
+curl -fsS "$APP_A/api/checklists/$OK_ID" > /tmp/list-a.json
+curl -fsS "$APP_B/api/checklists/$OK_ID" > /tmp/list-b.json
+python3 - <<'PY'
+import json
+a = json.load(open("/tmp/list-a.json")); b = json.load(open("/tmp/list-b.json"))
+assert a["summary"] == b["summary"] and a["state"] == b["state"], (a["summary"], b["summary"])
+print("两实例结论一致:", a["summary"])
+PY
+
 echo
-echo "全部演示步骤完成。浏览器打开 $APP_A 或 $APP_B 查看页面。"
+echo "全部演示步骤完成。浏览器打开 $APP_A 或 $APP_B 查看页面；齐套核对：$APP_A/checklists"

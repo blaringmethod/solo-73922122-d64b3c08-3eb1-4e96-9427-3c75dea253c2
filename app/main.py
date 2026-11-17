@@ -14,6 +14,13 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from .checklist import (
+    ChecklistError,
+    backfill_view,
+    checklist_view,
+    parse_checklist,
+    run_backfill_once,
+)
 from .collector import Collector, ScanBusy
 from .config import Settings, settings
 from .db import Database
@@ -55,9 +62,11 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
         db.init()
         store.init()
         stop = asyncio.Event()
-        task: asyncio.Task | None = None
+        tasks: list[asyncio.Task] = []
         if cfg.auto_scan_interval > 0:
-            task = asyncio.create_task(auto_loop(stop))
+            tasks.append(asyncio.create_task(auto_loop(stop)))
+        if cfg.auto_backfill:
+            tasks.append(asyncio.create_task(backfill_loop(stop)))
         log.info(
             "instance %s ready db=%s storage=%s imap=%s:%s account=%s",
             cfg.instance_id,
@@ -71,7 +80,7 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             yield
         finally:
             stop.set()
-            if task:
+            for task in tasks:
                 task.cancel()
                 try:
                     await task
@@ -91,6 +100,43 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                 raise
             except Exception:  # pragma: no cover - loop must survive
                 log.exception("automatic scan failed")
+
+    async def backfill_loop(stop: asyncio.Event) -> None:
+        """Advance the offline report projection without blocking collectors.
+
+        Exactly one instance holds the backfill lease at a time.  The loop
+        touches a few hundred reports per batch and then yields the thread, so
+        simultaneous scans and web requests keep working.  A restart resumes
+        from the committed cursor; until completion the UI says "准备中".
+        """
+        while not stop.is_set():
+            try:
+                summary = await asyncio.to_thread(
+                    run_backfill_once,
+                    db,
+                    cfg.instance_id,
+                    cfg.backfill_batch_size,
+                    cfg.backfill_lease_seconds,
+                    cfg.backfill_batches_per_tick,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover - loop must survive
+                log.exception("backfill batch failed")
+                summary = {"complete": False}
+            if summary.get("complete"):
+                log.info("report projection complete on %s", cfg.instance_id)
+                return
+            delay = (
+                max(cfg.backfill_pause_seconds, 0.0)
+                if summary.get("claimed")
+                else max(cfg.backfill_retry_seconds, 1.0)
+            )
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=delay)
+                return
+            except asyncio.TimeoutError:
+                pass
 
     def run_scan(trigger: str, raise_busy: bool = True):
         try:
@@ -161,6 +207,83 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             return RedirectResponse(f"/?flash=&error={_q(str(exc))}", status_code=303)
         return RedirectResponse(f"/?flash={_q(f'补标记完成：{marked} 封')}", status_code=303)
 
+    # -------------------------------------------------------------- checklists
+    @app.get("/checklists", response_class=HTMLResponse)
+    def checklist_index(request: Request):
+        return templates.TemplateResponse(
+            request,
+            "checklists.html",
+            {
+                "cfg": cfg,
+                "checklists": [dict(r) for r in db.list_checklists()],
+                "backfill": backfill_view(db),
+                "flash": request.query_params.get("flash", ""),
+                "error": request.query_params.get("error", ""),
+            },
+        )
+
+    @app.post("/checklists")
+    async def action_create_checklist(request: Request):
+        form = await request.form()
+        upload = form.get("file")
+        batch_field = str(form.get("batch_no") or "").strip()
+        try:
+            if upload is None or not getattr(upload, "filename", ""):
+                raise ChecklistError("empty_file", "未选择文件")
+            if getattr(upload, "size", None) and upload.size > cfg.max_checklist_bytes:
+                raise ChecklistError("too_large", f"{upload.size} 字节")
+            # Read at most one byte past the limit, so an oversized upload is
+            # rejected without loading it into memory.
+            content = await upload.read(cfg.max_checklist_bytes + 1)
+            parsed = parse_checklist(content, cfg.max_checklist_bytes, batch_field)
+            checklist_id, error = db.create_checklist(parsed.batch_no, parsed.pairs)
+        except ChecklistError as exc:
+            return RedirectResponse(
+                f"/checklists?flash=&error={_q(str(exc))}", status_code=303
+            )
+        if error or checklist_id is None:
+            return RedirectResponse(
+                f"/checklists?flash=&error={_q(error or '清单未受理')}", status_code=303
+            )
+        return RedirectResponse(f"/checklists/{checklist_id}", status_code=303)
+
+    @app.get("/checklists/{checklist_id}", response_class=HTMLResponse)
+    def checklist_detail(request: Request, checklist_id: int):
+        view = checklist_view(db, checklist_id)
+        if view is None:
+            raise HTTPException(status_code=404, detail="清单不存在")
+        return templates.TemplateResponse(
+            request,
+            "checklist_detail.html",
+            {"cfg": cfg, "view": view, "flash": request.query_params.get("flash", "")},
+        )
+
+    @app.post("/checklists/backfill")
+    async def action_backfill():
+        """Run the backfill to completion from the page (demo convenience).
+
+        The background loop does the same incrementally; this action just waits
+        for it, so an operator can watch "准备中" turn into a conclusion.
+        """
+        try:
+            await asyncio.to_thread(
+                run_backfill_once,
+                db,
+                cfg.instance_id,
+                cfg.backfill_batch_size,
+                cfg.backfill_lease_seconds,
+            )
+        except Exception as exc:
+            log.exception("manual backfill failed")
+            return RedirectResponse(
+                f"/checklists?flash=&error={_q(str(exc))}", status_code=303
+            )
+        progress = backfill_view(db)
+        label = progress.get("label", "")
+        return RedirectResponse(
+            f"/checklists?flash={_q('补建状态：' + label)}", status_code=303
+        )
+
     # -------------------------------------------------------------------- API
     @app.get("/healthz")
     def healthz():
@@ -209,6 +332,63 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
     @app.get("/api/messages")
     def api_messages(limit: int = 100, mark_state: str | None = None):
         return [_message_view(db, row) for row in db.list_messages(limit, mark_state)]
+
+    @app.post("/api/checklists")
+    async def api_create_checklist(request: Request):
+        """Accept a checklist (multipart ``file``, optional ``batch_no``).
+
+        Validation is all-or-nothing: a malformed file or an already accepted
+        batch number creates nothing and returns 400/409.
+        """
+        form = await request.form()
+        upload = form.get("file")
+        batch_field = str(form.get("batch_no") or "").strip()
+        try:
+            if upload is None or not getattr(upload, "filename", ""):
+                raise ChecklistError("empty_file", "未选择文件")
+            if getattr(upload, "size", None) and upload.size > cfg.max_checklist_bytes:
+                raise ChecklistError("too_large", f"{upload.size} 字节")
+            content = await upload.read(cfg.max_checklist_bytes + 1)
+            parsed = parse_checklist(content, cfg.max_checklist_bytes, batch_field)
+        except ChecklistError as exc:
+            raise HTTPException(
+                status_code=400, detail={"code": exc.code, "message": exc.message}
+            ) from exc
+        checklist_id, error = db.create_checklist(parsed.batch_no, parsed.pairs)
+        if checklist_id is None:
+            raise HTTPException(
+                status_code=409, detail={"code": "batch_exists", "message": error}
+            )
+        return JSONResponse(_checklist_api_view(db, checklist_id), status_code=201)
+
+    @app.get("/api/checklists")
+    def api_checklists(limit: int = 100):
+        return [_checklist_row_api(row) for row in db.list_checklists(limit)]
+
+    @app.post("/api/checklists/backfill")
+    async def api_backfill():
+        try:
+            summary = await asyncio.to_thread(
+                run_backfill_once,
+                db,
+                cfg.instance_id,
+                cfg.backfill_batch_size,
+                cfg.backfill_lease_seconds,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"补建失败：{exc}") from exc
+        return {"summary": summary, "backfill": backfill_view(db)}
+
+    @app.get("/api/checklists/{checklist_id}")
+    def api_checklist(checklist_id: int):
+        view = _checklist_api_view(db, checklist_id)
+        if view is None:
+            raise HTTPException(status_code=404, detail="清单不存在")
+        return view
+
+    @app.get("/api/backfill")
+    def api_backfill_status():
+        return backfill_view(db)
 
     @app.get("/api/messages/{message_id}")
     def api_message(message_id: int):
@@ -271,6 +451,56 @@ def _q(value: str) -> str:
     from urllib.parse import quote_plus
 
     return quote_plus(value)
+
+
+def _checklist_row_api(row) -> dict[str, Any]:
+    item = {key: row[key] for key in row.keys()}
+    for key in ("ok_count", "missing_count", "conflict_count", "pending_count"):
+        item[key] = int(item.get(key) or 0)
+    return item
+
+
+def _checklist_api_view(db: Database, checklist_id: int) -> dict[str, Any] | None:
+    view = checklist_view(db, checklist_id)
+    if view is None:
+        return None
+    checklist = view["checklist"]
+    return {
+        "id": checklist["id"],
+        "batch_no": checklist["batch_no"],
+        "created_at": checklist["created_at"],
+        "pair_count": checklist["pair_count"],
+        # While the archive projection is unfinished only "preparing" is
+        # exposed; no per-pair conclusion is published.
+        "state": "preparing" if view["preparing"] else checklist["state"],
+        "ready": view["ready"],
+        "summary": view["summary"],
+        "backfill": view["backfill"],
+        "pairs": [] if view["preparing"] else [
+            {
+                "sample_no": pair["sample_no"],
+                "item": pair["item"],
+                "status": pair["status"],
+                "values": [
+                    {
+                        "value": group["value"],
+                        "report_nos": group["report_nos"],
+                        "sources": [
+                            {
+                                "report_no": source["report_no"],
+                                "report_id": source["report_id"],
+                                "source": source["source"],
+                                "attachment_path": source["attachment_path"],
+                            }
+                            for source in group["sources"]
+                        ],
+                    }
+                    for group in pair["value_groups"]
+                ],
+            }
+            for pair in view["pairs"]
+        ],
+    }
 
 
 app = create_app()

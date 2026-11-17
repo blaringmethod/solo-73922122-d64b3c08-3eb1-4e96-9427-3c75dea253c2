@@ -27,7 +27,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .config import Settings
-from .db import Database, transaction, utcnow
+from .db import (
+    Database,
+    evaluate_open_checklist_tx,
+    record_live_values_tx,
+    transaction,
+    utcnow,
+)
 from .mailparse import parse_mail, validate_mail
 from .store import Store
 
@@ -645,6 +651,7 @@ class Collector:
                     ),
                 )
                 message_id = int(cur.lastrowid)
+                touched_pairs: set[tuple[str, str]] = set()
                 for item in prepared:
                     conn.execute(
                         """INSERT OR IGNORE INTO report
@@ -684,6 +691,24 @@ class Collector:
                             utcnow(),
                         ),
                     )
+                    # Keep the checklist projection current in the same
+                    # transaction as the report.  Values have already been
+                    # projected from the earlier delivery when the original is
+                    # reused, so INSERT OR IGNORE makes this a no-op then.
+                    report_row = conn.execute(
+                        """SELECT id, account, mailbox, report_no, rows_json
+                           FROM report
+                           WHERE account=? AND mailbox=? AND report_no=?""",
+                        (account, mailbox, item["report_no"]),
+                    ).fetchone()
+                    assert report_row is not None
+                    record_live_values_tx(conn, report_row)
+                    touched_pairs.update((row[1], row[2]) for row in item["rows"])
+                # Re-evaluate affected checklists in the same transaction, so
+                # a conflicting value cannot be committed while a checklist
+                # still claims to be ready.  No-op during an unfinished
+                # backfill (the checklist has no conclusion yet).
+                evaluate_open_checklist_tx(conn, touched_pairs)
         return {"reused": reused_count, "message_id": message_id}
 
     # ------------------------------------------------------------------ marks

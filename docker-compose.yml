@@ -29,6 +29,13 @@ x-common: &common
     # makes sure only one of them advances the mailbox at a time.
     AUTO_SCAN_INTERVAL: "0"
     SCAN_LEASE_SECONDS: "60"
+    # Online backfill of the existing report archive for checklist checks.
+    # Both instances run the loop; a database lease lets only one advance at a
+    # time, and the other picks up wherever the cursor was committed.
+    AUTO_BACKFILL: "1"
+    BACKFILL_BATCH_SIZE: "50"
+    BACKFILL_BATCHES_PER_TICK: "2"
+    BACKFILL_PAUSE_SECONDS: "0.2"
   volumes:
     - shared-data:/data
   healthcheck:

@@ -82,6 +82,41 @@ class Settings:
         default_factory=lambda: float(_env("AUTO_SCAN_INTERVAL", "15"))
     )
 
+    # Checklist export ("样本号,项目", optionally with 批号).  A checklist
+    # holds at most 100
+    # unique sample/item pairs and is immutable once accepted.
+    max_checklist_bytes: int = field(
+        default_factory=lambda: _env_int("MAX_CHECKLIST_BYTES", 64 * 1024)
+    )
+
+    # The report-value projection is built online from the existing archive
+    # and kept up to date by the ingestion transaction.  The backfill runs in
+    # small batches so collectors keep working meanwhile; a lease makes sure
+    # only one instance advances the cursor.
+    auto_backfill: bool = field(
+        default_factory=lambda: _env("AUTO_BACKFILL", "1").lower()
+        not in {"0", "false", "no"}
+    )
+    backfill_batch_size: int = field(
+        default_factory=lambda: _env_int("BACKFILL_BATCH_SIZE", 200)
+    )
+    # Batches per background tick, and a pause between ticks.  Together they
+    # bound how long the backfill holds the SQLite write lock at a time, so
+    # mail collection keeps making progress while the archive is projected.
+    backfill_batches_per_tick: int = field(
+        default_factory=lambda: _env_int("BACKFILL_BATCHES_PER_TICK", 5)
+    )
+    backfill_pause_seconds: float = field(
+        default_factory=lambda: float(_env("BACKFILL_PAUSE_SECONDS", "0.05"))
+    )
+    backfill_lease_seconds: float = field(
+        default_factory=lambda: float(_env("BACKFILL_LEASE_SECONDS", "60"))
+    )
+    # Delay before an instance retries a failed or abandoned backfill.
+    backfill_retry_seconds: float = field(
+        default_factory=lambda: float(_env("BACKFILL_RETRY_SECONDS", "5"))
+    )
+
     # UI presentation only.
     title: str = field(default_factory=lambda: _env("APP_TITLE", "检验附件入仓桥"))
 

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>齐套核对 · {{ cfg.title }}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>齐套核对</h1>
+  <p>提交批号与样本清单，用已收讫报告核对；清单受理后不可修改。</p>
+  <p class="nav"><a href="/">← 返回采集仪表盘</a></p>
+</header>
+<main>
+{% if flash %}<div class="flash ok">{{ flash }}</div>{% endif %}
+{% if error %}<div class="flash bad">错误：{{ error }}</div>{% endif %}
+
+<section class="panel">
+  <h2>报告库补建状态</h2>
+  <dl class="kv">
+    <dt>状态</dt><dd><span class="badge {{ 'ok' if backfill.status == 'complete' else 'warn' }}">{{ backfill.label }}</span></dd>
+    <dt>已投影报告</dt><dd>{{ backfill.reports_projected }} / {{ backfill.report_total }}（{{ backfill.percent }}%）</dd>
+    <dt>游标</dt><dd><code>report id &gt; {{ backfill.cursor_report_id }}</code></dd>
+    <dt>租约</dt><dd>{% if backfill.lease_instance %}{{ backfill.lease_instance }}{% else %}无{% endif %}</dd>
+  </dl>
+  <div class="actions">
+    <form method="post" action="/checklists/backfill"><button type="submit">推进补建</button></form>
+  </div>
+  <p class="hint">补建期间的清单只显示“准备中”，不显示任何缺项/冲突结论；采集继续正常工作。补建完成后才发布结论。</p>
+</section>
+
+<section class="panel">
+  <h2>提交新清单</h2>
+  <form method="post" action="/checklists" enctype="multipart/form-data" class="form">
+    <label>批号<input type="text" name="batch_no" placeholder="如 B2026-1117" required></label>
+    <label>清单 CSV<input type="file" name="file" accept=".csv,text/csv" required>
+      <small>表头“样本号,项目”或“批号,样本号,项目”，UTF-8，≤100 行，同一（样本号,项目）只出现一次。</small>
+    </label>
+    <button type="submit">受理清单</button>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>已受理清单</h2>
+  <table>
+    <thead><tr><th>#</th><th>批号</th><th>受理时间</th><th>对数</th>
+      <th>齐套</th><th>缺失</th><th>冲突</th><th>结论</th></tr></thead>
+    <tbody>
+    {% for c in checklists %}
+      <tr>
+        <td><a href="/checklists/{{ c.id }}">#{{ c.id }}</a></td>
+        <td><code>{{ c.batch_no }}</code></td>
+        <td class="nowrap">{{ c.created_at }}</td>
+        <td>{{ c.pair_count }}</td>
+        <td>{{ c.ok_count or 0 }}</td>
+        <td>{{ c.missing_count or 0 }}</td>
+        <td>{{ c.conflict_count or 0 }}</td>
+        <td>
+          {% if c.state == "ready" %}
+            <span class="badge ok">齐套，可交分析</span>
+          {% elif c.state == "not_ready" %}
+            <span class="badge bad">不齐套</span>
+          {% else %}
+            <span class="badge warn">准备中</span>
+          {% endif %}
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="8" class="empty">尚未受理清单。</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+</main>
+</body>
+</html>

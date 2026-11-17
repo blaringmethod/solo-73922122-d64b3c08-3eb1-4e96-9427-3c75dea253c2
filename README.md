@@ -5,6 +5,11 @@ UTF-8 CSV 检验附件（列：`报告号,样本号,项目,测值`，每件 ≤ 
 报告号）持久化为不可变原件与回执，然后才把邮件标记为已读。网页与 API 可发起
 采集、重试标记、查看拒收原因与“待标记”状态。
 
+同一套网页还提供**齐套核对**：上传批号 + 至多 100 行 `样本号,项目` 清单，用
+已收讫报告的全部数据行判断样本能否交分析。既有报告在线补建索引，补建期间的
+清单只显示“准备中”；补建完成后逐对报告缺项、冲突与来源报告号，冲突或收到
+异值时立即取消“可交分析”。
+
 ```
 ┌──────────┐   IMAP    ┌────────────┐   SQLite + 文件卷   ┌────────────┐
 │ 共享邮箱  │◀─────────▶│ web-a      │◀──────────────────▶│ /data      │
@@ -38,7 +43,8 @@ IMAP_PORT=1143 IMAP_ACCOUNT=lab@demo AUTO_SCAN_INTERVAL=0 \
   python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-`APP_A`/`APP_B`/`DEMO` 环境变量可让 `scripts/demo.sh` 指向任意地址。
+`APP_A`/`APP_B`/`DEMO` 环境变量可让 `scripts/demo.sh` 指向任意地址。齐套
+核对页面：`/checklists`（`web-a` 与 `web-b` 读写同一个库，结论一致）。
 
 ## 交付保证与实现位置
 
@@ -56,6 +62,17 @@ IMAP_PORT=1143 IMAP_ACCOUNT=lab@demo AUTO_SCAN_INTERVAL=0 \
 | 两实例并发 / 旧扫描不推进新进度 | `mailbox_state` 中的扫描租约（token + 心跳）；`set_progress`、`finish_scan`、标记全部以 token 与 uidvalidity 为条件 |
 | 标记后断连可演示 | 演示源 `POST /ctl/drop-store`：STORE 已生效但连接在回复前被关闭 |
 | 网页：采集 / 重试 / 拒收原因 / 待标记 | `GET /`、`POST /actions/scan`、`POST /actions/retry-marks`、`?mark=pending` 过滤；API 见下 |
+| 齐套核对：批号 + ≤100 行清单，受理后不可改 | `POST /api/checklists`（multipart `file` + `batch_no`）；`checklist_pairs` 的 `UNIQUE(checklist_id, sample_no, item)` 与 `checklist` 的 `UNIQUE(batch_no)`；解析见 `app/checklist.py::parse_checklist` |
+| 用已收讫报告的全部数据行核对；同对同测值只计一次；异值列出冲突报告号 | `report_value` / `report_value_source` 投影按 `(sample_no,item,value)` 去重；`checklist_detail.html` 按值分组列出来源报告号；状态由“不同测值个数”决定（0 缺项 / 1 齐套 / ≥2 冲突），测值按字符串比较 |
+| 无缺项且无冲突才报齐套 | `checklist.state='ready'` 仅当全部 pair 为 `ok`；页面文案“可交分析”只在此时出现 |
+| 既有报告在线补建、持续增量维护、查询不重扫报告库 | 补建游标 `backfill_state.cursor_report_id` 分批写入投影；页面/API 只读投影与索引；新报告在同一 SQLite 事务里写投影（`record_live_values_tx`） |
+| 补建期间仍可采集，已有及同期新增报告不得漏计或重复计入 | 补建只持有短批次写锁并让出；入库事务与补建对同一唯一键 `INSERT OR IGNORE`，两侧都写不会重复；完成后再补一轮即可覆盖补建期间落库、且入库事务已写入的报告 |
+| 完成前仅报准备中 | `checklist.state='evaluating'`；API 返回 `state="preparing"` 且 `pairs=[]`；补建失败/中断保持 `evaluating` |
+| 齐套后收到相关异值，随采集入库一起转冲突 | `_commit_acceptance_tx` 在同一事务里调用 `evaluate_open_checklist_tx`，冲突与报告同时提交，页面不再显示可交分析 |
+| 拒收邮件不参与 | 只有 `_commit_acceptance_tx` 写投影；拒收路径不写 `report`/`report_value` |
+| 双实例不重复累计、重启接续、失败不开放半份结论 | 补建租约 `backfill_state.lease_token` + 每批条件更新；提交点即游标，重启从游标续跑；`try_finish_backfill` 与清单初始化同事务 |
+| 网页可查缺项、冲突及来源 | `/checklists`、`/checklists/{id}`；来源含报告号、采集/补建标记、消息与附件原件链接 |
+| 保留原采集和下载行为 | 仪表盘与既有 `/api/messages`、原件/回执/附件下载未改；`tests/test_web.py` 全绿 |
 
 ### 关键不变式
 
@@ -68,7 +85,7 @@ IMAP_PORT=1143 IMAP_ACCOUNT=lab@demo AUTO_SCAN_INTERVAL=0 \
 ## 存储布局
 
 ```
-/data/bridge.sqlite3          SQLite（WAL）
+/data/bridge.sqlite3          SQLite（WAL；含核对投影与补建游标）
 /data/store/msgs/<sha256>.eml
 /data/store/attachments/<报告号>/<sha256>-<文件名>.csv
 /data/store/receipts/<sha256>.json
@@ -92,6 +109,15 @@ SHA-256、附件 SHA-256 与全部数据行，可脱离数据库核对。
 | GET | `/api/messages/{id}/original` | 下载原始 RFC822 原件 |
 | GET | `/api/messages/{id}/receipt` | 下载固定回执 JSON |
 | GET | `/api/reports/{id}/attachment` | 下载 CSV 原件 |
+| GET | `/checklists` | 齐套核对：补建状态、提交清单、已受理清单 |
+| POST | `/checklists` | 页面提交清单（multipart `file` + `batch_no`），303 到详情 |
+| GET | `/checklists/{id}` | 逐对缺项 / 冲突 / 来源 |
+| POST | `/checklists/backfill` | 页面按钮：把补建推进到完成 |
+| POST | `/api/checklists` | 受理清单；成功 201，格式错误 400，重复批号 409 |
+| GET | `/api/checklists` | 清单列表与计数 |
+| GET | `/api/checklists/{id}` | 清单结论；补建中 `state=preparing`、`pairs=[]` |
+| POST | `/api/checklists/backfill` | 推进补建（可重复调用） |
+| GET | `/api/backfill` | 补建状态、游标、百分比 |
 
 演示源控制 API（`demo-imap:8081`）：`POST /ctl/deliver` 投递、`POST /ctl/rebuild`
 （`{"purge":false}` 重建 UIDVALIDITY 并重排 UID）、`POST /ctl/drop-store`
@@ -106,7 +132,9 @@ python -m pytest -q
 
 覆盖：CSV 校验矩阵、整封拒收、同号同原件复用、同号异文冲突、预先已读、
 标记后断连 + 补标记、UIDVALIDITY 重建与 UID 复用、扫描中途重建、并发租约、
-重启续扫、下载接口与网页动作。
+重启续扫、下载接口与网页动作；以及齐套核对的清单解析矩阵（≤100 行、重复对、
+批号一致）、补建增量/续跑/双实例并发不重复、补建中只报准备中、缺项/同值去重/
+异值冲突、齐套后晚到异值翻转、拒收不参与、清单不可改。
 
 ## 配置项
 
@@ -123,6 +151,13 @@ python -m pytest -q
 | `MAX_ATTACHMENTS_PER_MAIL` | `3` | 单封附件数上限 |
 | `AUTO_SCAN_INTERVAL` | `15`（Compose 中 `0`） | 自动扫描间隔秒；0 关闭 |
 | `SCAN_LEASE_SECONDS` | `60` | 扫描租约时长 |
+| `MAX_CHECKLIST_BYTES` | `65536` | 清单 CSV 上限 |
+| `AUTO_BACKFILL` | `1` | 启动后台补建循环 |
+| `BACKFILL_BATCH_SIZE` | `200` | 每批报告数 |
+| `BACKFILL_BATCHES_PER_TICK` | `5` | 每次循环批数（有界写锁） |
+| `BACKFILL_PAUSE_SECONDS` | `0.05` | 批次之间让出时间 |
+| `BACKFILL_LEASE_SECONDS` | `60` | 补建租约时长 |
+| `BACKFILL_RETRY_SECONDS` | `5` | 租约被占用时的重试间隔 |
 
 ## 未实现 / 边界
 
